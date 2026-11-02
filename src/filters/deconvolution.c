@@ -245,6 +245,7 @@ int load_kernel(gchar* filename, estk_data *args) {
 		orig_size = com.kernelsize;
 	}
 	com.kernelchannels = load_fit.naxes[2];
+	args->ks = com.kernelsize;
 	args->kchans = com.kernelchannels;
 	gui_function(set_kernel_size_in_gui, NULL);
 
