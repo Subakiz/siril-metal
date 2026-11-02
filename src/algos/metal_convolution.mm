@@ -23,8 +23,10 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 
-#include "metal_convolution.h"
+#include "core/siril.h"
+#include "algos/metal_convolution.h"
 
 namespace {
 const char *shader_source = R"metal(
@@ -144,6 +146,11 @@ int siril_metal_convolve_float(const float *input, const float *kernel,
 		[command waitUntilCompleted];
 		if (command.status != MTLCommandBufferStatusCompleted) return 0;
 		std::memcpy(output, destination.contents, bytes);
+		static std::once_flag logged;
+		std::call_once(logged, [&] {
+			siril_log_debug("Metal convolution: device %s, %dx%d k%d\n",
+					backend.device.name.UTF8String, width, height, kernel_size);
+		});
 		return 1;
 	}
 }
