@@ -44,6 +44,7 @@ free-astro 2022-2023.
 #include <complex>
 #include <functional>
 #include <numeric>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +53,9 @@ free-astro 2022-2023.
 #include "algos/img_t/fftw_allocator.hpp"
 #include "algos/img_t/image_boundary.hpp"
 #include "core/siril.h"
+#ifdef HAVE_METAL
+#include "algos/metal_convolution.h"
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -501,6 +505,14 @@ public:
         assert(x.similar(*this));
 
         img_t<T> out(x.w, x.h, x.d);
+#ifdef HAVE_METAL
+        if constexpr (std::is_same_v<T, float> && std::is_same_v<T2, float> && std::is_same_v<T3, float>) {
+            if (siril_metal_convolve_float(x.data.data(), k.data.data(), out.data.data(), x.w, x.h, x.d, k.w)) {
+                (*this).map(out);
+                return;
+            }
+        }
+#endif
         const int ix = (k.w-1)/2;
 
         // Main convolution (excluding borders)

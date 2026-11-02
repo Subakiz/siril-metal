@@ -244,6 +244,18 @@ endif
 
 # Dependencies
 no_dep = dependency('', required: false)
+metal_dep = no_dep
+have_metal = false
+if not get_option('metal').disabled()
+  if platform_osx
+    if add_languages('objcpp', native: false, required: get_option('metal'))
+      metal_dep = dependency('appleframeworks', modules: ['Foundation', 'Metal'], required: get_option('metal'))
+      have_metal = metal_dep.found()
+    endif
+  elif get_option('metal').enabled()
+    error('Metal acceleration requires macOS')
+  endif
+endif
 
 ## Core dependencies
 dbghelp = platform_windows ? cc.find_library('dbghelp') : no_dep
@@ -541,6 +553,7 @@ conf_data.set('SIRIL_OUTPUT_DEBUG', get_option('buildtype').startswith('debug') 
 conf_data.set('ENABLE_RELOCATABLE_RESOURCES', relocatable_bundle ? 1 : false)
 conf_data.set('OS_OSX', platform_osx ? 1 : false)
 conf_data.set('HAVE_GTK', enable_gtk ? 1 : false, description : 'Build includes GTK GUI support.')
+conf_data.set('HAVE_METAL', have_metal ? 1 : false, description : 'Spatial convolution uses Metal when available.')
 conf_data.set('HAVE_X11_DND_FALLBACK', enable_x11_dnd_fallback ? 1 : false, description : 'GTK4 X11 drag-and-drop fallback compiled in (libX11 linked).')
 
 conf_data.set('SIRIL_MAJOR_VERSION', siril_version_major)
@@ -752,6 +765,7 @@ core_dep = declare_dependency(
   dependencies: [
     dbghelp,
     m_dep,
+    metal_dep,
     glib_dep,
     gio_dep,
     gio_platform_dep,

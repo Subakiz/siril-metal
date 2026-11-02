@@ -18,6 +18,12 @@ option('openmp',
  description: 'build with OpenMP support'
 )
 
+option('metal',
+ type : 'feature',
+ value : 'auto',
+ description : 'Accelerate spatial Richardson-Lucy convolution with Metal on macOS'
+)
+
 option('exiv2',
  type : 'boolean',
  value : true,

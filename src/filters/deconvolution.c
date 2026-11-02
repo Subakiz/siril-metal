@@ -945,7 +945,11 @@ static int deconvolution_compute_mem_limits(struct generic_seq_args *seqargs, gb
 			required += MB_per_float_chan * 16;
 		} else if (data->deconv_data->nonblindtype == DECONV_RL) {
 			if (data->deconv_data->ks < com.pref.fftw_conf.fft_cutoff) {
+#ifdef HAVE_METAL
+				required += MB_per_float_chan * 8; // Naive deconvolution with Metal buffers
+#else
 				required += MB_per_float_chan * 6; // Naive deconvolution
+#endif
 			} else {
 				required += MB_per_float_chan * 13; // FFT deconvolution
 			}

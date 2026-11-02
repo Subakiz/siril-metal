@@ -2,6 +2,16 @@
 # Siril Tests
 #
 
+# Metal convolution test (ObjC++, macOS only, no Criterion needed)
+if have_metal
+  convolution_exec = executable('metal_convolution_test',
+                                'metal_convolution_test.cpp',
+                                dependencies : siril_dep,
+                                link_args : siril_link_arg,
+                                cpp_args : siril_cpp_flag + ['-x', 'objective-c++'])
+  test('metal_convolution', convolution_exec, timeout : 180)
+endif
+
 # Criterion based unit-tests
 if criterion_dep.found()
      sorting_exec = executable('sorting',

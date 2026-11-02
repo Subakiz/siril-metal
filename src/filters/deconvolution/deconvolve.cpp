@@ -84,7 +84,11 @@ extern "C" int fft_richardson_lucy(float *fdata, unsigned rx, unsigned ry, unsig
 }
 
 extern "C" int naive_richardson_lucy(float *fdata, unsigned rx, unsigned ry, unsigned nchans, float *kernel, int kernelsize, unsigned kchans, float lambda, int maxiter, float stopcriterion, int max_threads, regtype_t regtype, float stepsize, int stopcriterion_active) {
+#ifdef HAVE_METAL
+    const int num_copies_required = 9;
+#else
     const int num_copies_required = 7;
+#endif
     img_t<float>::use_threading(max_threads);
     img_t<float> u;
     for (unsigned c = 0 ; c < nchans ; c++) {
