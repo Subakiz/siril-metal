@@ -1,0 +1,7 @@
+requires 1.4.0
+set32bits
+load mono.fit
+makepsf manual -gaussian -fwhm=3 -ks=13
+rl -iters=10 -mul
+save out3
+close

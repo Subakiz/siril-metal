@@ -1,0 +1,5 @@
+requires 1.4.0
+set32bits
+load mono.fit
+rl -loadpsf=psf15.fit -iters=5 -fh -alpha=3000 -stop=0.999
+close

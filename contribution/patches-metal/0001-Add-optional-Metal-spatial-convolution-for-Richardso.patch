@@ -1,0 +1,670 @@
+From 165029eb2eb7d3b60900c5934f3c1d6788f971b1 Mon Sep 17 00:00:00 2001
+From: nabils <nabileo477@gmail.com>
+Date: Mon, 2 Nov 2026 06:54:29 +0700
+Subject: [PATCH 1/2] Add optional Metal spatial convolution for
+ Richardson-Lucy deconvolution on macOS
+
+Add a Metal compute backend for single-precision spatial convolution,
+selected with the new meson option "metal" (auto, enabled, disabled;
+default auto, only active on macOS). When enabled, img_t::conv2 calls
+siril_metal_convolve_float for float images with an odd kernel size from
+7 to 31 and at least 32 Mi kernel taps (pixels * kernel_size^2). Smaller
+or unsupported inputs, and any Metal setup or execution failure, fall
+back to the existing CPU implementation, which is unchanged. The FFT
+branch of Richardson-Lucy is not affected.
+
+The shader uses the same zero-boundary correlation and accumulation
+order as the CPU code. The naive RL memory estimate in
+deconvolution_compute_mem_limits reserves two extra float buffers when
+Metal is compiled in.
+
+Add src/tests/metal_convolution_test.cpp, covering the CPU/Metal
+results, fallbacks, aliasing and concurrent calls. The test is registered only
+when Metal is built, and skips when no Metal device is present.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ meson.build                              |  14 ++
+ meson_options.txt                        |   6 +
+ src/algos/img_t/image.hpp                |  12 ++
+ src/algos/metal_convolution.h            |  36 ++++
+ src/algos/metal_convolution.mm           | 149 +++++++++++++
+ src/filters/deconvolution.c              |   4 +
+ src/filters/deconvolution/deconvolve.cpp |   4 +
+ src/meson.build                          |   7 +-
+ src/tests/meson.build                    |  10 +
+ src/tests/metal_convolution_test.cpp     | 254 +++++++++++++++++++++++
+ 10 files changed, 495 insertions(+), 1 deletion(-)
+ create mode 100644 src/algos/metal_convolution.h
+ create mode 100644 src/algos/metal_convolution.mm
+ create mode 100644 src/tests/metal_convolution_test.cpp
+
+diff --git a/meson.build b/meson.build
+index 417eaf8..7843e7f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -244,6 +244,18 @@ endif
+ 
+ # Dependencies
+ no_dep = dependency('', required: false)
++metal_dep = no_dep
++have_metal = false
++if not get_option('metal').disabled()
++  if platform_osx
++    if add_languages('objcpp', native: false, required: get_option('metal'))
++      metal_dep = dependency('appleframeworks', modules: ['Foundation', 'Metal'], required: get_option('metal'))
++      have_metal = metal_dep.found()
++    endif
++  elif get_option('metal').enabled()
++    error('Metal acceleration requires macOS')
++  endif
++endif
+ 
+ ## Core dependencies
+ dbghelp = platform_windows ? cc.find_library('dbghelp') : no_dep
+@@ -541,6 +553,7 @@ conf_data.set('SIRIL_OUTPUT_DEBUG', get_option('buildtype').startswith('debug')
+ conf_data.set('ENABLE_RELOCATABLE_RESOURCES', relocatable_bundle ? 1 : false)
+ conf_data.set('OS_OSX', platform_osx ? 1 : false)
+ conf_data.set('HAVE_GTK', enable_gtk ? 1 : false, description : 'Build includes GTK GUI support.')
++conf_data.set('HAVE_METAL', have_metal ? 1 : false, description : 'Spatial convolution uses Metal when available.')
+ conf_data.set('HAVE_X11_DND_FALLBACK', enable_x11_dnd_fallback ? 1 : false, description : 'GTK4 X11 drag-and-drop fallback compiled in (libX11 linked).')
+ 
+ conf_data.set('SIRIL_MAJOR_VERSION', siril_version_major)
+@@ -752,6 +765,7 @@ core_dep = declare_dependency(
+   dependencies: [
+     dbghelp,
+     m_dep,
++    metal_dep,
+     glib_dep,
+     gio_dep,
+     gio_platform_dep,
+diff --git a/meson_options.txt b/meson_options.txt
+index ef72134..83f0589 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -18,6 +18,12 @@ option('openmp',
+  description: 'build with OpenMP support'
+ )
+ 
++option('metal',
++ type : 'feature',
++ value : 'auto',
++ description : 'Accelerate spatial Richardson-Lucy convolution with Metal on macOS'
++)
++
+ option('exiv2',
+  type : 'boolean',
+  value : true,
+diff --git a/src/algos/img_t/image.hpp b/src/algos/img_t/image.hpp
+index 6c98ede..911afbc 100644
+--- a/src/algos/img_t/image.hpp
++++ b/src/algos/img_t/image.hpp
+@@ -44,6 +44,7 @@ free-astro 2022-2023.
+ #include <complex>
+ #include <functional>
+ #include <numeric>
++#include <type_traits>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -52,6 +53,9 @@ free-astro 2022-2023.
+ #include "algos/img_t/fftw_allocator.hpp"
+ #include "algos/img_t/image_boundary.hpp"
+ #include "core/siril.h"
++#ifdef HAVE_METAL
++#include "algos/metal_convolution.h"
++#endif
+ 
+ #ifdef _OPENMP
+ #include <omp.h>
+@@ -501,6 +505,14 @@ public:
+         assert(x.similar(*this));
+ 
+         img_t<T> out(x.w, x.h, x.d);
++#ifdef HAVE_METAL
++        if constexpr (std::is_same_v<T, float> && std::is_same_v<T2, float> && std::is_same_v<T3, float>) {
++            if (siril_metal_convolve_float(x.data.data(), k.data.data(), out.data.data(), x.w, x.h, x.d, k.w)) {
++                (*this).map(out);
++                return;
++            }
++        }
++#endif
+         const int ix = (k.w-1)/2;
+ 
+         // Main convolution (excluding borders)
+diff --git a/src/algos/metal_convolution.h b/src/algos/metal_convolution.h
+new file mode 100644
+index 0000000..e1f9561
+--- /dev/null
++++ b/src/algos/metal_convolution.h
+@@ -0,0 +1,36 @@
++/*
++ * This file is part of Siril, an astronomy image processor.
++ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
++ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
++ * Reference site is https://siril.org
++ *
++ * Siril is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Siril is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef SIRIL_METAL_CONVOLUTION_H
++#define SIRIL_METAL_CONVOLUTION_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Planar float correlation with zero borders, matching img_t::conv2.
++ * Returns 1 on success, or 0 to use the CPU with output untouched.
++ * Input and output may alias. */
++int siril_metal_convolve_float(const float *input, const float *kernel,
++		float *output, int width, int height, int channels, int kernel_size);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/algos/metal_convolution.mm b/src/algos/metal_convolution.mm
+new file mode 100644
+index 0000000..2b98f76
+--- /dev/null
++++ b/src/algos/metal_convolution.mm
+@@ -0,0 +1,149 @@
++/*
++ * This file is part of Siril, an astronomy image processor.
++ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
++ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
++ * Reference site is https://siril.org
++ *
++ * Siril is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Siril is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
++ */
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++
++#include <climits>
++#include <cstdint>
++#include <cstring>
++
++#include "metal_convolution.h"
++
++namespace {
++const char *shader_source = R"metal(
++#include <metal_stdlib>
++using namespace metal;
++
++kernel void convolve_float(device const float *input [[buffer(0)]],
++                          device const float *weights [[buffer(1)]],
++                          device float *output [[buffer(2)]],
++                          constant uint *p [[buffer(3)]],
++                          uint index [[thread_position_in_grid]]) {
++    if (index >= p[3]) return;
++    const int width = int(p[0]), height = int(p[1]), size = int(p[2]);
++    const uint plane_size = p[0] * p[1];
++    const uint plane = index / plane_size;
++    const int x = int(index % p[0]);
++    const int y = int((index % plane_size) / p[0]);
++    const int radius = size / 2;
++    float sum = 0.0f;
++    // Preserve the CPU's correlation orientation and accumulation order.
++    for (int m = -radius; m <= radius; ++m) {
++        const int sx = x + m;
++        if (sx < 0 || sx >= width) continue;
++        for (int n = -radius; n <= radius; ++n) {
++            const int sy = y + n;
++            if (sy >= 0 && sy < height)
++                sum += input[plane * plane_size + uint(sy * width + sx)] *
++                       weights[(n + radius) * size + m + radius];
++        }
++    }
++    output[index] = sum;
++}
++)metal";
++
++struct Backend {
++	id<MTLDevice> device = nil;
++	id<MTLCommandQueue> queue = nil;
++	id<MTLComputePipelineState> pipeline = nil;
++
++	Backend() {
++		device = MTLCreateSystemDefaultDevice();
++		if (!device) return;
++		MTLCompileOptions *options = [[[MTLCompileOptions alloc] init] autorelease];
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
++		if (@available(macOS 15.0, *))
++			options.mathMode = MTLMathModeSafe;
++		else
++#endif
++		{
++			// Fast math off keeps results bit-compatible with the CPU path.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++			options.fastMathEnabled = NO;
++#pragma clang diagnostic pop
++		}
++		id<MTLLibrary> library = [[device newLibraryWithSource:
++				[NSString stringWithUTF8String:shader_source]
++				options:options error:nil] autorelease];
++		if (!library) return;
++		id<MTLFunction> function = [[library newFunctionWithName:@"convolve_float"] autorelease];
++		if (!function) return;
++		pipeline = [device newComputePipelineStateWithFunction:function error:nil];
++		if (pipeline) queue = [device newCommandQueue];
++	}
++
++	~Backend() {
++		[queue release];
++		[pipeline release];
++		[device release];
++	}
++};
++}
++
++int siril_metal_convolve_float(const float *input, const float *kernel,
++		float *output, int width, int height, int channels, int kernel_size) {
++	// Kernels above 31 stay on CPU until larger PSFs are benchmarked.
++	if (!input || !kernel || !output || width <= 0 || height <= 0 || channels <= 0 ||
++			kernel_size < 3 || kernel_size > 31 || !(kernel_size & 1) ||
++			kernel_size > width || kernel_size > height)
++		return 0;
++	const uint64_t plane_size = uint64_t(width) * uint64_t(height);
++	if (plane_size > INT_MAX || uint64_t(channels) > INT_MAX / plane_size)
++		return 0;
++	const uint32_t count = uint32_t(plane_size * channels);
++	// Small convolutions cost less on CPU than Metal allocation and submission.
++	if (kernel_size < 7 || uint64_t(count) * kernel_size * kernel_size < 32ULL * 1024 * 1024)
++		return 0;
++	const size_t bytes = size_t(count) * sizeof(float);
++	const size_t kernel_bytes = size_t(kernel_size) * kernel_size * sizeof(float);
++
++	@autoreleasepool {
++		static Backend backend;
++		if (!backend.queue || bytes > backend.device.maxBufferLength)
++			return 0;
++		id<MTLBuffer> source = [[backend.device newBufferWithBytes:input
++				length:bytes options:MTLResourceStorageModeShared] autorelease];
++		id<MTLBuffer> weights = [[backend.device newBufferWithBytes:kernel
++				length:kernel_bytes options:MTLResourceStorageModeShared] autorelease];
++		id<MTLBuffer> destination = [[backend.device newBufferWithLength:bytes
++				options:MTLResourceStorageModeShared] autorelease];
++		if (!source || !weights || !destination) return 0;
++		id<MTLCommandBuffer> command = [backend.queue commandBuffer];
++		id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
++		if (!command || !encoder) return 0;
++		const uint32_t parameters[] = { uint32_t(width), uint32_t(height),
++				uint32_t(kernel_size), count };
++		[encoder setComputePipelineState:backend.pipeline];
++		[encoder setBuffer:source offset:0 atIndex:0];
++		[encoder setBuffer:weights offset:0 atIndex:1];
++		[encoder setBuffer:destination offset:0 atIndex:2];
++		[encoder setBytes:parameters length:sizeof(parameters) atIndex:3];
++		const NSUInteger group_size = backend.pipeline.threadExecutionWidth;
++		[encoder dispatchThreadgroups:MTLSizeMake((count + group_size - 1) / group_size, 1, 1)
++				threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
++		[encoder endEncoding];
++		[command commit];
++		[command waitUntilCompleted];
++		if (command.status != MTLCommandBufferStatusCompleted) return 0;
++		std::memcpy(output, destination.contents, bytes);
++		return 1;
++	}
++}
+diff --git a/src/filters/deconvolution.c b/src/filters/deconvolution.c
+index 51c8c4c..32b3c33 100644
+--- a/src/filters/deconvolution.c
++++ b/src/filters/deconvolution.c
+@@ -945,7 +945,11 @@ static int deconvolution_compute_mem_limits(struct generic_seq_args *seqargs, gb
+ 			required += MB_per_float_chan * 16;
+ 		} else if (data->deconv_data->nonblindtype == DECONV_RL) {
+ 			if (data->deconv_data->ks < com.pref.fftw_conf.fft_cutoff) {
++#ifdef HAVE_METAL
++				required += MB_per_float_chan * 8; // Naive deconvolution with Metal buffers
++#else
+ 				required += MB_per_float_chan * 6; // Naive deconvolution
++#endif
+ 			} else {
+ 				required += MB_per_float_chan * 13; // FFT deconvolution
+ 			}
+diff --git a/src/filters/deconvolution/deconvolve.cpp b/src/filters/deconvolution/deconvolve.cpp
+index 89c192e..24535d8 100644
+--- a/src/filters/deconvolution/deconvolve.cpp
++++ b/src/filters/deconvolution/deconvolve.cpp
+@@ -84,7 +84,11 @@ extern "C" int fft_richardson_lucy(float *fdata, unsigned rx, unsigned ry, unsig
+ }
+ 
+ extern "C" int naive_richardson_lucy(float *fdata, unsigned rx, unsigned ry, unsigned nchans, float *kernel, int kernelsize, unsigned kchans, float lambda, int maxiter, float stopcriterion, int max_threads, regtype_t regtype, float stepsize, int stopcriterion_active) {
++#ifdef HAVE_METAL
++    const int num_copies_required = 9;
++#else
+     const int num_copies_required = 7;
++#endif
+     img_t<float>::use_threading(max_threads);
+     img_t<float> u;
+     for (unsigned c = 0 ; c < nchans ; c++) {
+diff --git a/src/meson.build b/src/meson.build
+index 4acfdd2..9fe18b4 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -401,12 +401,17 @@ siril_resources = gnome.compile_resources(
+   source_dir : [ '..', '.' ],
+   c_name : 'siril_resource')
+ 
++if have_metal
++  src_files += files('algos/metal_convolution.mm')
++endif
++
+ siril_lib = static_library('siril',
+                            siril_resources[0], src_files,
+                            dependencies: core_dep,
+                            include_directories: siril_inc_dir,
+                            c_args : siril_c_flag,
+-                           cpp_args : siril_cpp_flag)
++                           cpp_args : siril_cpp_flag,
++                           objcpp_args : siril_cpp_flag + ['-std=c++17'])
+ 
+ siril_headless_lib = static_library('siril_headless',
+                                     'core/headless_stubs.c',
+diff --git a/src/tests/meson.build b/src/tests/meson.build
+index 8129f89..b9d717f 100644
+--- a/src/tests/meson.build
++++ b/src/tests/meson.build
+@@ -2,6 +2,16 @@
+ # Siril Tests
+ #
+ 
++# Metal convolution test (ObjC++, macOS only, no Criterion needed)
++if have_metal
++  convolution_exec = executable('metal_convolution_test',
++                                'metal_convolution_test.cpp',
++                                dependencies : siril_dep,
++                                link_args : siril_link_arg,
++                                cpp_args : siril_cpp_flag + ['-x', 'objective-c++'])
++  test('metal_convolution', convolution_exec, timeout : 180)
++endif
++
+ # Criterion based unit-tests
+ if criterion_dep.found()
+      sorting_exec = executable('sorting',
+diff --git a/src/tests/metal_convolution_test.cpp b/src/tests/metal_convolution_test.cpp
+new file mode 100644
+index 0000000..49591ab
+--- /dev/null
++++ b/src/tests/metal_convolution_test.cpp
+@@ -0,0 +1,254 @@
++/*
++ * This file is part of Siril, an astronomy image processor.
++ * Copyright (C) 2005-2011 Francois Meyer (dulle at free.fr)
++ * Copyright (C) 2012-2026 team free-astro (see more in AUTHORS file)
++ * Reference site is https://siril.org
++ *
++ * Siril is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Siril is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Siril. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Synthetic correctness checks and an optional end-to-end conv2 benchmark.
++ */
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <climits>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++
++#include "algos/img_t/image.hpp"
++#ifdef HAVE_METAL
++#include "algos/metal_convolution.h"
++#import <Metal/Metal.h>
++#endif
++
++cominfo com;
++int sequence_is_running = 0;
++
++static void require(bool condition, const char *message) {
++	if (!condition) {
++		std::fprintf(stderr, "FAIL: %s\n", message);
++		std::exit(1);
++	}
++}
++
++static img_t<float> image(int width, int height, int channels, int seed) {
++	img_t<float> result(width, height, channels);
++	for (int c = 0; c < channels; ++c)
++		for (int y = 0; y < height; ++y)
++			for (int x = 0; x < width; ++x)
++				result(x, y, c) = ((x * 17 + y * 31 + c * 43 + seed * 13) % 251 - 125) / 127.f;
++	return result;
++}
++
++static img_t<float> kernel(int size, int seed) {
++	img_t<float> result(size, size, 1);
++	float sum = 0.f;
++	for (int y = 0; y < size; ++y)
++		for (int x = 0; x < size; ++x) {
++			const float value = 1.f + (x * 3 + y * 7 + seed * 11) % 19;
++			result(x, y) = value;
++			sum += value;
++		}
++	for (float &value : result.data)
++		value /= sum;
++	return result;
++}
++
++// Siril's conv2 is correlation (no kernel flip), with zero padding.
++static img_t<float> reference(const img_t<float>& input, const img_t<float>& weights) {
++	img_t<float> result(input.w, input.h, input.d);
++	const int radius = weights.w / 2;
++	for (int c = 0; c < input.d; ++c)
++		for (int y = 0; y < input.h; ++y)
++			for (int x = 0; x < input.w; ++x) {
++				float sum = 0.f;
++				for (int dx = -radius; dx <= radius; ++dx)
++					for (int dy = -radius; dy <= radius; ++dy)
++						if (x + dx >= 0 && x + dx < input.w && y + dy >= 0 && y + dy < input.h)
++							sum += input(x + dx, y + dy, c) * weights(dx + radius, dy + radius);
++				result(x, y, c) = sum;
++			}
++	return result;
++}
++
++static void compare(const img_t<float>& actual, const img_t<float>& expected, const char *label) {
++	require(actual.similar(expected), "output shape");
++	float maximum_error = 0.f;
++	for (size_t i = 0; i < actual.data.size(); ++i) {
++		const float error = std::abs(actual.data[i] - expected.data[i]);
++		if (!std::isfinite(actual.data[i]) || error > 2e-5f + 2e-5f * std::abs(expected.data[i])) {
++			std::fprintf(stderr, "FAIL: %s pixel %zu: %.9g expected %.9g\n", label, i, actual.data[i], expected.data[i]);
++			std::exit(1);
++		}
++		maximum_error = std::max(maximum_error, error);
++	}
++	std::printf("PASS: %s (%dx%dx%d, max absolute error %.3g)\n", label, actual.w, actual.h, actual.d, maximum_error);
++}
++
++#ifdef HAVE_METAL
++static int metal(const img_t<float>& input, const img_t<float>& weights, img_t<float>& output) {
++	return siril_metal_convolve_float(input.data.data(), weights.data.data(), output.data.data(),
++			input.w, input.h, input.d, weights.w);
++}
++
++static void concurrent_calls() {
++	std::array<std::thread, 4> workers;
++	for (int n = 0; n < 4; ++n)
++		workers[n] = std::thread([n] {
++			auto input = image(521, 509, 1, n + 20);
++			auto weights = kernel(13, n + 10);
++			img_t<float> output(input.w, input.h, input.d);
++			require(metal(input, weights, output) == 1, "concurrent Metal call must succeed");
++			compare(output, reference(input, weights), "concurrent Metal");
++		});
++	for (auto& worker : workers)
++		worker.join();
++}
++
++static void invalid_arguments() {
++	float input[9] = {}, weights[9] = {}, output[9];
++	std::fill(output, output + 9, 123.f);
++	auto rejected = [&](const float *in, const float *k, float *out, int w, int h, int d, int ks) {
++		require(siril_metal_convolve_float(in, k, out, w, h, d, ks) == 0, "invalid arguments must fall back");
++		for (float value : output)
++			require(value == 123.f, "fallback must leave output untouched");
++	};
++	rejected(nullptr, weights, output, 3, 3, 1, 3);
++	rejected(input, nullptr, output, 3, 3, 1, 3);
++	rejected(input, weights, nullptr, 3, 3, 1, 3);
++	rejected(input, weights, output, 0, 3, 1, 3);
++	rejected(input, weights, output, 3, -1, 1, 3);
++	rejected(input, weights, output, 3, 3, 0, 3);
++	rejected(input, weights, output, 3, 3, 1, 2);
++	rejected(input, weights, output, 3, 3, 1, 1);
++	rejected(input, weights, output, 3, 3, 1, 5);
++	rejected(input, weights, output, 33, 33, 1, 33);
++	rejected(input, weights, output, INT_MAX, 3, 1, 3);
++	rejected(input, weights, output, INT_MAX, INT_MAX, 1, 3);
++	rejected(input, weights, output, 3, 3, INT_MAX, 3);
++	rejected(input, weights, output, 3, 3, 1, 3); // Valid small workload falls back too.
++	std::puts("PASS: invalid arguments preserve output");
++}
++#endif
++
++static void non_float_fallback() {
++	auto input = image(17, 19, 1, 9);
++	auto weights = kernel(3, 7);
++	auto expected = reference(input, weights);
++	img_t<double> input64(input.w, input.h, input.d), weights64(3, 3, 1), output64(input.w, input.h, input.d);
++	std::copy(input.data.begin(), input.data.end(), input64.data.begin());
++	std::copy(weights.data.begin(), weights.data.end(), weights64.data.begin());
++	output64.conv2(input64, weights64);
++	img_t<float> mixed(input.w, input.h, input.d);
++	mixed.conv2(input, weights64);
++	compare(mixed, expected, "mixed kernel type CPU fallback");
++	for (size_t i = 0; i < expected.data.size(); ++i)
++		require(std::abs(output64.data[i] - expected.data[i]) < 2e-5, "double precision CPU fallback");
++	std::puts("PASS: double precision CPU fallback");
++}
++
++static void benchmark() {
++	for (int side : {64, 128, 256, 512, 1024}) {
++	for (int ks : {3, 5, 7, 13}) {
++		auto input = image(side, side, 1, 7);
++		auto weights = kernel(ks, 4);
++		img_t<float> output(input.w, input.h, input.d);
++		const auto cold_start = std::chrono::steady_clock::now();
++		output.conv2(input, weights);
++		const auto warm_start = std::chrono::steady_clock::now();
++		constexpr int repeats = 30;
++		std::vector<double> samples;
++		for (int n = 0; n < repeats; ++n) {
++			const auto start = std::chrono::steady_clock::now();
++			output.conv2(input, weights);
++			samples.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
++		}
++		std::sort(samples.begin(), samples.end());
++		const auto end = std::chrono::steady_clock::now();
++		const double cold_ms = std::chrono::duration<double, std::milli>(warm_start - cold_start).count();
++		const double warm_ms = std::chrono::duration<double, std::milli>(end - warm_start).count() / repeats;
++#ifdef HAVE_METAL
++		const char *mode = "Metal-enabled";
++#else
++		const char *mode = "CPU";
++#endif
++		std::printf("BENCH: %s actual img_t::conv2 %dx%d mono k%d cold %.3f ms warm mean %.3f ms median %.3f ms (allocation/transfers included), sample %.9g\n",
++				mode, side, side, ks, cold_ms, warm_ms, samples[repeats / 2], output.data[output.size / 2]);
++	}
++	}
++}
++
++int main(int argc, char **argv) {
++	com.max_thread = std::max(2u, std::thread::hardware_concurrency());
++#ifdef _OPENMP
++	std::printf("OpenMP enabled, configured CPU threads: %d\n", com.max_thread);
++#else
++	std::puts("OpenMP disabled");
++#endif
++	if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) {
++		benchmark();
++		return 0;
++	}
++	require(argc == 1, "usage: metal_convolution_test [--benchmark]");
++	non_float_fallback();
++#ifdef HAVE_METAL
++	invalid_arguments();
++	// Large enough to exercise the backend instead of its small-workload fallback.
++	auto probe = image(1024, 1024, 1, 0);
++	auto probe_kernel = kernel(7, 0);
++	img_t<float> probe_output(probe.w, probe.h, probe.d);
++	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++	if (!device) {
++		std::puts("SKIP: no Metal device");
++		return 77;
++	}
++	std::printf("Metal device: %s\n", [[device name] UTF8String]);
++	[device release];
++	require(metal(probe, probe_kernel, probe_output) == 1, "Metal backend failed on an available device");
++	compare(probe_output, reference(probe, probe_kernel), "Metal mono probe");
++	concurrent_calls();
++#endif
++	for (int width : {17, 521}) {
++	for (int channels : {1, 3}) {
++		for (int ks : {3, 5, 7, 13}) {
++			for (int seed : {1, 2}) {
++				auto input = image(width, width == 17 ? 19 : 509, channels, seed);
++				auto weights = kernel(ks, seed);
++				auto expected = reference(input, weights);
++				img_t<float> output(input.w, input.h, input.d);
++				output.conv2(input, weights);
++				compare(output, expected, "img_t::conv2");
++				auto alias = input;
++				alias.conv2(alias, weights);
++				compare(alias, expected, "img_t::conv2 in-place");
++#ifdef HAVE_METAL
++				if (metal(input, weights, output)) {
++					compare(output, expected, "direct Metal");
++					alias = input;
++					require(metal(alias, weights, alias) == 1, "Metal in-place workload must succeed");
++					compare(alias, expected, "direct Metal in-place");
++				}
++#endif
++			}
++		}
++	}
++	}
++	return 0;
++}
+-- 
+2.55.0
+

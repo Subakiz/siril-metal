@@ -1,0 +1,30 @@
+From f025eca510c51ad21de695f73ea82fbbecd26c05 Mon Sep 17 00:00:00 2001
+From: nabils <nabileo477@gmail.com>
+Date: Mon, 2 Nov 2026 06:54:34 +0700
+Subject: [PATCH] Set kernel size in deconvolution args when loading a PSF
+
+load_kernel updated com.kernelsize but left args->ks unchanged, so
+anything keyed on args->ks (for example the choice between the naive
+and FFT Richardson-Lucy paths and the memory estimate) used a stale
+size after a PSF was loaded from file. Copy the loaded size to args->ks.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/filters/deconvolution.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/filters/deconvolution.c b/src/filters/deconvolution.c
+index 51c8c4c..03499a8 100644
+--- a/src/filters/deconvolution.c
++++ b/src/filters/deconvolution.c
+@@ -245,6 +245,7 @@ int load_kernel(gchar* filename, estk_data *args) {
+ 		orig_size = com.kernelsize;
+ 	}
+ 	com.kernelchannels = load_fit.naxes[2];
++	args->ks = com.kernelsize;
+ 	args->kchans = com.kernelchannels;
+ 	gui_function(set_kernel_size_in_gui, NULL);
+ 
+-- 
+2.55.0
+
